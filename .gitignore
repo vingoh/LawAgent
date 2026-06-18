@@ -1,0 +1,6 @@
+.DS_Store
+dataset/
+indexes**/
+.cursor/
+__pycache__/
+*.pyc
