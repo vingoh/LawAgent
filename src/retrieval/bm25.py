@@ -67,6 +67,7 @@ def _load_index() -> None:
 
 def retrieve_bm25(
     query: str,
+    search_text: str | None = None,
     k: int = 200,
     k_court: int = 300,
     k_law: int = 300,
@@ -79,8 +80,9 @@ def retrieve_bm25(
     _load_index()
 
     extracted = extract_citations_from_query(query)
+    text_for_search = search_text if search_text is not None else query
     tokenized_q = tokenize_for_bm25(
-        [query], citations=[extracted], show_progress=False
+        [text_for_search], citations=[extracted], show_progress=False
     )
 
     court_results, _ = _retriever_court.retrieve(

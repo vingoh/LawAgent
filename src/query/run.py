@@ -8,10 +8,12 @@ Usage:
 
 import argparse
 import csv
+import json
 import os
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from query.rewrite import format_search_text, rewrite_query
 from retrieval.bm25 import retrieve_bm25
 
 ROOT_DIR    = os.path.join(os.path.dirname(__file__), "../..")
@@ -20,8 +22,22 @@ DEFAULT_INPUT  = os.path.join(DATASET_DIR, "val.csv")
 DEFAULT_OUTPUT = os.path.join(ROOT_DIR, "results/predictions.csv")
 
 
+def _log_rewrite(log_dir: str, query_id: str, result) -> None:
+    os.makedirs(log_dir, exist_ok=True)
+    path = os.path.join(log_dir, f"{query_id}.json")
+    payload = {
+        "query_id": query_id,
+        "legal_issue": result.legal_issue,
+        "expected_codes": result.expected_codes,
+        "search_terms": result.search_terms,
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+
 def predict_citations(
     query: str,
+    use_rewrite: bool = True,
     k: int = 200,
     k_court: int = 300,
     k_law: int = 300,
@@ -30,9 +46,14 @@ def predict_citations(
     weight_court: float = 1.0,
     rrf_k: int = 60,
 ) -> list[str]:
-    """Baseline pipeline: dual BM25 + query extraction RRF fusion."""
+    """Query pipeline: optional LLM rewrite + dual BM25 + extraction RRF."""
+    search_text = None
+    if use_rewrite:
+        result = rewrite_query(query)
+        search_text = format_search_text(result, lang="de")
     return retrieve_bm25(
         query,
+        search_text=search_text,
         k=k,
         k_court=k_court,
         k_law=k_law,
@@ -78,14 +99,24 @@ def run(
     weight_law: float,
     weight_court: float,
     rrf_k: int,
+    use_rewrite: bool = True,
+    rewrite_log_dir: str | None = None,
 ) -> None:
     queries = load_queries(input_path)
     results: list[tuple[str, str]] = []
     for i, row in enumerate(queries, 1):
         qid = row["query_id"]
+        query = row["query"]
         print(f"[{i}/{len(queries)}] {qid}", file=sys.stderr)
-        citations = predict_citations(
-            row["query"],
+        search_text = None
+        if use_rewrite:
+            rewrite_result = rewrite_query(query)
+            search_text = format_search_text(rewrite_result, lang="de")
+            if rewrite_log_dir:
+                _log_rewrite(rewrite_log_dir, qid, rewrite_result)
+        citations = retrieve_bm25(
+            query,
+            search_text=search_text,
             k=k,
             k_court=k_court,
             k_law=k_law,
@@ -110,6 +141,8 @@ def main() -> None:
     parser.add_argument("--weight-law", type=float, default=1.2)
     parser.add_argument("--weight-court", type=float, default=1.0)
     parser.add_argument("--rrf-k", type=int, default=60)
+    parser.add_argument("--no-rewrite", action="store_true", help="Skip LLM query rewrite")
+    parser.add_argument("--rewrite-log", default=None, help="Directory for per-query rewrite JSON logs")
     args = parser.parse_args()
     run(
         args.input,
@@ -121,6 +154,8 @@ def main() -> None:
         weight_law=args.weight_law,
         weight_court=args.weight_court,
         rrf_k=args.rrf_k,
+        use_rewrite=not args.no_rewrite,
+        rewrite_log_dir=args.rewrite_log,
     )
 
 

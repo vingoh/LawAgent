@@ -9,5 +9,6 @@
 | [bm25_german_preprocessing_b22d6480.plan.md](bm25_german_preprocessing_b22d6480.plan.md) | BM25 德语预处理（停用词、stem、citation token） | 已实现 |
 | [query_eval_decouple_plan.plan.md](query_eval_decouple_plan.plan.md) | Query / Eval 解耦：predictions CSV 接口 | 已实现 |
 | [bm25_split_rrf.plan.md](bm25_split_rrf.plan.md) | BM25 court/law 分路召回 + 加权 RRF 融合 | 已实现 |
+| [query_rewrite.plan.md](query_rewrite.plan.md) | LLM Query Rewrite：pipeline 第一步 + BM25 search_text | 已实现 |
 
 新计划请创建在本目录，命名建议：`<主题>_<简短描述>.plan.md`。
