@@ -18,17 +18,27 @@ INDEX_DIR   = os.path.join(os.path.dirname(__file__), "../../indexes")
 COURT_CSV = os.path.join(DATASET_DIR, "court_considerations.csv")
 LAWS_CSV  = os.path.join(DATASET_DIR, "laws_de.csv")
 
+# French → German law-code abbreviations (court_considerations text is often French)
+CODE_MAP = {
+    "CPP": "StPO",
+    "CPC": "ZPO",
+    "CP": "StGB",
+    "CC": "ZGB",
+    "CO": "OR",
+    "LCR": "SVG",
+    "LTF": "BGG",
+    "LOAP": "StBOG",
+    "LPGA": "ATSG",
+    "LAI": "IVG",
+    "LDIP": "IPRG",
+    "Cst.": "BV",
+    "Cst": "BV",
+}
+
 
 # ---------------------------------------------------------------------------
 # Filters
 # ---------------------------------------------------------------------------
-
-def _has_numeric_sr_code(citation: str) -> bool:
-    """Return True for laws_de rows that use numeric SR codes, e.g. 'Art. 1 112'.
-    These cannot match gold citations which use abbreviations (OR, ZGB, ...).
-    """
-    return bool(re.search(r'\s[\d.]+$', citation))
-
 
 def _is_malformed_consideration(citation: str) -> bool:
     """Return True for court consideration citations with date-embedded noise.
@@ -43,6 +53,17 @@ def _is_malformed_consideration(citation: str) -> bool:
     return False
 
 
+def _apply_code_map(text: str) -> str:
+    """Replace French law-code abbreviations with German equivalents."""
+    for old in sorted(CODE_MAP, key=len, reverse=True):
+        text = re.sub(
+            r"(?<!\w)" + re.escape(old) + r"(?!\w)",
+            CODE_MAP[old],
+            text,
+        )
+    return text
+
+
 # ---------------------------------------------------------------------------
 # Loaders
 # ---------------------------------------------------------------------------
@@ -55,9 +76,6 @@ def load_laws(path: str) -> list[dict]:
         reader = csv.DictReader(f)
         for row in tqdm(reader, desc="Loading laws_de"):
             citation = row["citation"].strip()
-            if _has_numeric_sr_code(citation):
-                skipped += 1
-                continue
             title = row.get("title", "").strip()
             text  = row["text"].strip()
             indexed_text = " ".join(filter(None, [citation, title, text]))
@@ -92,8 +110,9 @@ def load_court(path: str) -> list[dict]:
                 grouped[citation] = {"citation": citation, "text": text}
 
     rows = []
-    for cit, d in grouped.items():
-        indexed_text = cit + " " + d["text"]
+    for cit, d in tqdm(grouped.items(), desc="Applying CODE_MAP"):
+        normalized_text = _apply_code_map(d["text"])
+        indexed_text = cit + " " + normalized_text
         rows.append({
             "citation":     cit,
             "text":         d["text"],
