@@ -5,3 +5,4 @@ indexes**/
 __pycache__/
 *.pyc
 results/
+.env
