@@ -11,25 +11,35 @@ import csv
 import json
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from query.rewrite import format_search_text, rewrite_query
-from retrieval.bm25 import retrieve_bm25
+from retrieval.bm25 import _load_index, retrieve_bm25
 
 ROOT_DIR    = os.path.join(os.path.dirname(__file__), "../..")
 DATASET_DIR = os.path.join(ROOT_DIR, "dataset")
 DEFAULT_INPUT  = os.path.join(DATASET_DIR, "val.csv")
 DEFAULT_OUTPUT = os.path.join(ROOT_DIR, "results/predictions.csv")
+DEFAULT_REWRITE_LOG_DIR = os.path.join(ROOT_DIR, "results/rewrite_logs")
 
 
-def _log_rewrite(log_dir: str, query_id: str, result) -> None:
+def _log_rewrite(
+    log_dir: str,
+    query_id: str,
+    query: str,
+    result,
+    search_text: str,
+) -> None:
     os.makedirs(log_dir, exist_ok=True)
     path = os.path.join(log_dir, f"{query_id}.json")
     payload = {
         "query_id": query_id,
+        "query": query,
         "legal_issue": result.legal_issue,
         "expected_codes": result.expected_codes,
         "search_terms": result.search_terms,
+        "search_text": search_text,
     }
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
@@ -37,8 +47,11 @@ def _log_rewrite(log_dir: str, query_id: str, result) -> None:
 
 def predict_citations(
     query: str,
+    *,
     use_rewrite: bool = True,
-    k: int = 200,
+    query_id: str | None = None,
+    rewrite_log_dir: str | None = None,
+    k: int = 700,
     k_court: int = 300,
     k_law: int = 300,
     weight_extracted: float = 2.0,
@@ -49,8 +62,10 @@ def predict_citations(
     """Query pipeline: optional LLM rewrite + dual BM25 + extraction RRF."""
     search_text = None
     if use_rewrite:
-        result = rewrite_query(query)
-        search_text = format_search_text(result, lang="de")
+        rewrite_result = rewrite_query(query)
+        search_text = format_search_text(rewrite_result, lang="de")
+        if rewrite_log_dir and query_id:
+            _log_rewrite(rewrite_log_dir, query_id, query, rewrite_result, search_text)
     return retrieve_bm25(
         query,
         search_text=search_text,
@@ -89,6 +104,36 @@ def write_predictions(path: str, rows: list[tuple[str, str]]) -> None:
             writer.writerow({"query_id": qid, "predicted_citations": pred})
 
 
+def _process_query(
+    row: dict[str, str],
+    *,
+    use_rewrite: bool,
+    rewrite_log_dir: str | None,
+    k: int,
+    k_court: int,
+    k_law: int,
+    weight_extracted: float,
+    weight_law: float,
+    weight_court: float,
+    rrf_k: int,
+) -> tuple[str, str]:
+    qid = row["query_id"]
+    citations = predict_citations(
+        row["query"],
+        use_rewrite=use_rewrite,
+        query_id=qid,
+        rewrite_log_dir=rewrite_log_dir,
+        k=k,
+        k_court=k_court,
+        k_law=k_law,
+        weight_extracted=weight_extracted,
+        weight_law=weight_law,
+        weight_court=weight_court,
+        rrf_k=rrf_k,
+    )
+    return qid, format_citations(citations)
+
+
 def run(
     input_path: str,
     output_path: str,
@@ -101,33 +146,47 @@ def run(
     rrf_k: int,
     use_rewrite: bool = True,
     rewrite_log_dir: str | None = None,
+    workers: int = 4,
 ) -> None:
     queries = load_queries(input_path)
-    results: list[tuple[str, str]] = []
-    for i, row in enumerate(queries, 1):
-        qid = row["query_id"]
-        query = row["query"]
-        print(f"[{i}/{len(queries)}] {qid}", file=sys.stderr)
-        search_text = None
-        if use_rewrite:
-            rewrite_result = rewrite_query(query)
-            search_text = format_search_text(rewrite_result, lang="de")
-            if rewrite_log_dir:
-                _log_rewrite(rewrite_log_dir, qid, rewrite_result)
-        citations = retrieve_bm25(
-            query,
-            search_text=search_text,
-            k=k,
-            k_court=k_court,
-            k_law=k_law,
-            weight_extracted=weight_extracted,
-            weight_law=weight_law,
-            weight_court=weight_court,
-            rrf_k=rrf_k,
-        )
-        results.append((qid, format_citations(citations)))
-    write_predictions(output_path, results)
+    if not queries:
+        write_predictions(output_path, [])
+        print(f"Wrote 0 predictions → {output_path}", file=sys.stderr)
+        return
+
+    _load_index()
+    process_kwargs = {
+        "use_rewrite": use_rewrite,
+        "rewrite_log_dir": rewrite_log_dir,
+        "k": k,
+        "k_court": k_court,
+        "k_law": k_law,
+        "weight_extracted": weight_extracted,
+        "weight_law": weight_law,
+        "weight_court": weight_court,
+        "rrf_k": rrf_k,
+    }
+
+    results: dict[int, tuple[str, str]] = {}
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {
+            pool.submit(_process_query, row, **process_kwargs): i
+            for i, row in enumerate(queries)
+        }
+        done = 0
+        for fut in as_completed(futures):
+            i = futures[fut]
+            results[i] = fut.result()
+            done += 1
+            qid, _ = results[i]
+            print(f"[{done}/{len(queries)}] {qid}", file=sys.stderr)
+
+    write_predictions(
+        output_path, [results[i] for i in range(len(queries))]
+    )
     print(f"Wrote {len(results)} predictions → {output_path}", file=sys.stderr)
+    if use_rewrite and rewrite_log_dir:
+        print(f"Rewrite logs → {rewrite_log_dir}", file=sys.stderr)
 
 
 def main() -> None:
@@ -142,8 +201,25 @@ def main() -> None:
     parser.add_argument("--weight-court", type=float, default=1.0)
     parser.add_argument("--rrf-k", type=int, default=60)
     parser.add_argument("--no-rewrite", action="store_true", help="Skip LLM query rewrite")
-    parser.add_argument("--rewrite-log", default=None, help="Directory for per-query rewrite JSON logs")
+    parser.add_argument(
+        "--rewrite-log",
+        default=DEFAULT_REWRITE_LOG_DIR,
+        help=f"Directory for per-query rewrite JSON logs (default: {DEFAULT_REWRITE_LOG_DIR})",
+    )
+    parser.add_argument(
+        "--no-rewrite-log",
+        action="store_true",
+        help="Do not write rewrite JSON logs",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=4,
+        help="Parallel worker threads (default: 4; use 1 for sequential)",
+    )
     args = parser.parse_args()
+    if args.workers < 1:
+        parser.error("--workers must be >= 1")
     run(
         args.input,
         args.output,
@@ -155,7 +231,8 @@ def main() -> None:
         weight_court=args.weight_court,
         rrf_k=args.rrf_k,
         use_rewrite=not args.no_rewrite,
-        rewrite_log_dir=args.rewrite_log,
+        rewrite_log_dir=None if args.no_rewrite_log else args.rewrite_log,
+        workers=args.workers,
     )
 
 

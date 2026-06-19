@@ -68,7 +68,7 @@ def _load_index() -> None:
 def retrieve_bm25(
     query: str,
     search_text: str | None = None,
-    k: int = 200,
+    k: int = 700,
     k_court: int = 300,
     k_law: int = 300,
     weight_extracted: float = 2.0,
