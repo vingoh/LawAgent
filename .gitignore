@@ -4,3 +4,4 @@ indexes**/
 .cursor/
 __pycache__/
 *.pyc
+results/
