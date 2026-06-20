@@ -1,7 +1,6 @@
 """BM25 retrieval over the law corpus."""
 
 import os
-import pickle
 import re
 import sys
 
@@ -9,13 +8,13 @@ import bm25s
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from indexing.bm25_tokenize import tokenize_for_bm25
+from retrieval import corpus as _corpus_mod
 from retrieval.rrf import weighted_rrf
 
 ROOT_DIR    = os.path.join(os.path.dirname(__file__), "../..")
 INDEX_DIR   = os.path.join(ROOT_DIR, "indexes")
 BM25_COURT_DIR = os.path.join(INDEX_DIR, "bm25_court")
 BM25_LAW_DIR   = os.path.join(INDEX_DIR, "bm25_law")
-CORPUS_PATH = os.path.join(INDEX_DIR, "corpus.pkl")
 
 STATUTE_RE = re.compile(
     r'Art\.\s*\d+(?:\s+Abs\.\s*\d+(?:\s+lit\.\s*\w+)?)?'
@@ -48,19 +47,16 @@ def _load_index() -> None:
     if not os.path.isdir(BM25_COURT_DIR) or not os.path.isdir(BM25_LAW_DIR):
         raise FileNotFoundError(
             f"BM25 indexes not found at {BM25_COURT_DIR} and/or {BM25_LAW_DIR}. "
-            "Run: python src/indexing/build_bm25.py"
+            "Run: conda run -n agent python src/indexing/build_bm25.py"
         )
     print("Loading BM25 court index ...", file=sys.stderr)
     _retriever_court = bm25s.BM25.load(BM25_COURT_DIR, load_corpus=False)
     print("Loading BM25 law index ...", file=sys.stderr)
     _retriever_law = bm25s.BM25.load(BM25_LAW_DIR, load_corpus=False)
-    print("Loading corpus.pkl ...", file=sys.stderr)
-    with open(CORPUS_PATH, "rb") as f:
-        corpus = pickle.load(f)
-    _corpus_court = [d for d in corpus if d["source"] == "court"]
-    _corpus_law = [d for d in corpus if d["source"] == "law"]
+    _corpus_court = _corpus_mod.get_corpus_court()
+    _corpus_law   = _corpus_mod.get_corpus_law()
     print(
-        f"Ready. Court: {len(_corpus_court):,}, law: {len(_corpus_law):,}",
+        f"BM25 ready. Court: {len(_corpus_court):,}, law: {len(_corpus_law):,}",
         file=sys.stderr,
     )
 

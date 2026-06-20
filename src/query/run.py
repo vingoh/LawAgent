@@ -15,6 +15,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from query.rewrite import format_search_text, rewrite_query
+from retrieval import corpus
 from retrieval.bm25 import _load_index as _load_bm25_index, retrieve_bm25_parts
 from retrieval.dense import (
     _load_index as _load_dense_index,
@@ -22,6 +23,7 @@ from retrieval.dense import (
     dense_law_exists,
     retrieve_dense_parts,
 )
+from retrieval.rerank import _load_reranker, rerank, reranker_exists
 from retrieval.rrf import weighted_rrf
 
 ROOT_DIR    = os.path.join(os.path.dirname(__file__), "../..")
@@ -31,6 +33,7 @@ DEFAULT_OUTPUT = os.path.join(ROOT_DIR, "results/predictions.csv")
 DEFAULT_REWRITE_LOG_DIR = os.path.join(ROOT_DIR, "results/rewrite_logs")
 _USE_DENSE_COURT: bool = dense_court_exists()
 _USE_DENSE_LAW:   bool = dense_law_exists()
+_USE_RERANK: bool = reranker_exists()
 
 
 def _print_run_config(
@@ -39,6 +42,9 @@ def _print_run_config(
     *,
     use_rewrite: bool,
     rewrite_log_dir: str | None,
+    use_rerank: bool,
+    rerank_top_k: int,
+    rerank_batch_size: int,
 ) -> None:
     print("Run configuration:", file=sys.stderr)
     print(f"  ROOT_DIR                = {ROOT_DIR}", file=sys.stderr)
@@ -48,6 +54,7 @@ def _print_run_config(
     print(f"  DEFAULT_REWRITE_LOG_DIR = {DEFAULT_REWRITE_LOG_DIR}", file=sys.stderr)
     print(f"  dense_court             = {_USE_DENSE_COURT}", file=sys.stderr)
     print(f"  dense_law               = {_USE_DENSE_LAW}", file=sys.stderr)
+    print(f"  reranker                = {_USE_RERANK and use_rerank} (top_k={rerank_top_k}, batch={rerank_batch_size})", file=sys.stderr)
     print(f"  input (actual)          = {input_path}", file=sys.stderr)
     print(f"  output (actual)         = {output_path}", file=sys.stderr)
     print(f"  use_rewrite             = {use_rewrite}", file=sys.stderr)
@@ -80,6 +87,9 @@ def predict_citations(
     query: str,
     *,
     use_rewrite: bool = True,
+    use_rerank: bool = True,
+    rerank_top_k: int = 100,
+    rerank_batch_size: int = 32,
     query_id: str | None = None,
     rewrite_log_dir: str | None = None,
     k: int = 700,
@@ -95,7 +105,7 @@ def predict_citations(
     weight_court: float | None = None,
     weight_law: float | None = None,
 ) -> list[str]:
-    """Query pipeline: optional LLM rewrite + 5-way weighted RRF fusion."""
+    """Query pipeline: optional LLM rewrite + 5-way weighted RRF fusion + optional reranker."""
     if weight_court is not None:
         weight_bm25_court = weight_court
     if weight_law is not None:
@@ -150,7 +160,21 @@ def predict_citations(
         if _USE_DENSE_LAW and dense_law:
             rankings.append((dense_law, weight_dense_law))
 
-    return weighted_rrf(rankings, rrf_k=rrf_k)[:k]
+    rrf_result = weighted_rrf(rankings, rrf_k=rrf_k)
+
+    if use_rerank and _USE_RERANK:
+        rerank_query = query
+        if search_text is not None:
+            rerank_query = query + " " + search_text
+        rrf_result = rerank(
+            rerank_query,
+            rrf_result,
+            corpus.get_corpus_texts(),
+            top_k=rerank_top_k,
+            batch_size=rerank_batch_size,
+        )
+
+    return rrf_result[:k]
 
 
 def format_citations(citations: list[str]) -> str:
@@ -182,6 +206,9 @@ def _process_query(
     row: dict[str, str],
     *,
     use_rewrite: bool,
+    use_rerank: bool,
+    rerank_top_k: int,
+    rerank_batch_size: int,
     rewrite_log_dir: str | None,
     k: int,
     k_court: int,
@@ -197,6 +224,9 @@ def _process_query(
     citations = predict_citations(
         row["query"],
         use_rewrite=use_rewrite,
+        use_rerank=use_rerank,
+        rerank_top_k=rerank_top_k,
+        rerank_batch_size=rerank_batch_size,
         query_id=qid,
         rewrite_log_dir=rewrite_log_dir,
         k=k,
@@ -225,6 +255,9 @@ def run(
     weight_dense_law: float,
     rrf_k: int,
     use_rewrite: bool = True,
+    use_rerank: bool = True,
+    rerank_top_k: int = 100,
+    rerank_batch_size: int = 32,
     rewrite_log_dir: str | None = None,
     workers: int = 4,
 ) -> None:
@@ -233,6 +266,9 @@ def run(
         output_path,
         use_rewrite=use_rewrite,
         rewrite_log_dir=rewrite_log_dir,
+        use_rerank=use_rerank,
+        rerank_top_k=rerank_top_k,
+        rerank_batch_size=rerank_batch_size,
     )
     queries = load_queries(input_path)
     if not queries:
@@ -240,12 +276,18 @@ def run(
         print(f"Wrote 0 predictions → {output_path}", file=sys.stderr)
         return
 
+    corpus.load_corpus()
     _load_bm25_index()
     if _USE_DENSE_COURT or _USE_DENSE_LAW:
         _load_dense_index(use_court=_USE_DENSE_COURT, use_law=_USE_DENSE_LAW)
+    if use_rerank and _USE_RERANK:
+        _load_reranker()
 
     process_kwargs = {
         "use_rewrite": use_rewrite,
+        "use_rerank": use_rerank,
+        "rerank_top_k": rerank_top_k,
+        "rerank_batch_size": rerank_batch_size,
         "rewrite_log_dir": rewrite_log_dir,
         "k": k,
         "k_court": k_court,
@@ -299,6 +341,12 @@ def main() -> None:
                         help="Deprecated alias for --weight-bm25-law")
     parser.add_argument("--rrf-k", type=int, default=60)
     parser.add_argument("--no-rewrite", action="store_true", help="Skip LLM query rewrite")
+    parser.add_argument("--no-rerank", action="store_true",
+                        help="Skip reranker (default: reranker ON if model exists)")
+    parser.add_argument("--rerank-top-k", type=int, default=100,
+                        help="Number of RRF candidates sent to reranker (default: 100)")
+    parser.add_argument("--rerank-batch-size", type=int, default=32,
+                        help="Reranker inference batch size (default: 32)")
     parser.add_argument(
         "--rewrite-log",
         default=DEFAULT_REWRITE_LOG_DIR,
@@ -335,6 +383,9 @@ def main() -> None:
         weight_dense_law=args.weight_dense_law,
         rrf_k=args.rrf_k,
         use_rewrite=not args.no_rewrite,
+        use_rerank=not args.no_rerank,
+        rerank_top_k=args.rerank_top_k,
+        rerank_batch_size=args.rerank_batch_size,
         rewrite_log_dir=None if args.no_rewrite_log else args.rewrite_log,
         workers=args.workers,
     )

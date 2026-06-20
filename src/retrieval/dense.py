@@ -1,7 +1,6 @@
 """Dense retrieval using BAAI/bge-m3 + FAISS IndexFlatIP."""
 
 import os
-import pickle
 import sys
 from pathlib import Path
 
@@ -10,11 +9,11 @@ from sentence_transformers import SentenceTransformer
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from retrieval.rrf import weighted_rrf
+from retrieval import corpus as _corpus_mod
 
-ROOT_DIR    = Path(__file__).resolve().parents[2]
-INDEX_DIR   = ROOT_DIR / "indexes"
-CORPUS_PATH = INDEX_DIR / "corpus.pkl"
-MODEL_PATH  = str(ROOT_DIR / "models" / "bge-m3")
+ROOT_DIR   = Path(__file__).resolve().parents[2]
+INDEX_DIR  = ROOT_DIR / "indexes"
+MODEL_PATH = str(ROOT_DIR / "models" / "bge-m3")
 
 _loaded:       bool                       = False
 _model:        SentenceTransformer | None = None
@@ -44,12 +43,6 @@ def _load_index(use_court: bool = True, use_law: bool = True) -> None:
     if _loaded:
         return
 
-    if not CORPUS_PATH.exists():
-        raise FileNotFoundError(
-            f"corpus.pkl not found: {CORPUS_PATH}. "
-            "Run: python src/indexing/build_corpus.py"
-        )
-
     import torch
     device = (
         "mps"  if torch.backends.mps.is_available() else
@@ -74,11 +67,8 @@ def _load_index(use_court: bool = True, use_law: bool = True) -> None:
         )
         print(f"dense_law ready: {_index_law.ntotal:,} vectors", file=sys.stderr)
 
-    print("Loading corpus.pkl for dense …", file=sys.stderr)
-    with open(CORPUS_PATH, "rb") as f:
-        corpus = pickle.load(f)
-    _corpus_court = [d for d in corpus if d["source"] == "court"]
-    _corpus_law   = [d for d in corpus if d["source"] == "law"]
+    _corpus_court = _corpus_mod.get_corpus_court()
+    _corpus_law   = _corpus_mod.get_corpus_law()
     _loaded = True
 
 
