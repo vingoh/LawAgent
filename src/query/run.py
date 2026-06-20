@@ -15,13 +15,22 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from query.rewrite import format_search_text, rewrite_query
-from retrieval.bm25 import _load_index, retrieve_bm25
+from retrieval.bm25 import _load_index as _load_bm25_index, retrieve_bm25_parts
+from retrieval.dense import (
+    _load_index as _load_dense_index,
+    dense_court_exists,
+    dense_law_exists,
+    retrieve_dense_parts,
+)
+from retrieval.rrf import weighted_rrf
 
 ROOT_DIR    = os.path.join(os.path.dirname(__file__), "../..")
 DATASET_DIR = os.path.join(ROOT_DIR, "dataset")
 DEFAULT_INPUT  = os.path.join(DATASET_DIR, "val.csv")
 DEFAULT_OUTPUT = os.path.join(ROOT_DIR, "results/predictions.csv")
 DEFAULT_REWRITE_LOG_DIR = os.path.join(ROOT_DIR, "results/rewrite_logs")
+_USE_DENSE_COURT: bool = dense_court_exists()
+_USE_DENSE_LAW:   bool = dense_law_exists()
 
 
 def _log_rewrite(
@@ -55,28 +64,52 @@ def predict_citations(
     k_court: int = 300,
     k_law: int = 300,
     weight_extracted: float = 2.0,
-    weight_law: float = 1.2,
-    weight_court: float = 1.0,
+    weight_bm25_court: float = 1.0,
+    weight_bm25_law: float = 1.2,
+    weight_dense_court: float = 1.0,
+    weight_dense_law: float = 1.2,
     rrf_k: int = 60,
+    # deprecated aliases kept for backward compatibility
+    weight_court: float | None = None,
+    weight_law: float | None = None,
 ) -> list[str]:
-    """Query pipeline: optional LLM rewrite + dual BM25 + extraction RRF."""
+    """Query pipeline: optional LLM rewrite + 5-way weighted RRF fusion."""
+    if weight_court is not None:
+        weight_bm25_court = weight_court
+    if weight_law is not None:
+        weight_bm25_law = weight_law
+
     search_text = None
     if use_rewrite:
         rewrite_result = rewrite_query(query)
         search_text = format_search_text(rewrite_result, lang="de")
         if rewrite_log_dir and query_id:
             _log_rewrite(rewrite_log_dir, query_id, query, rewrite_result, search_text)
-    return retrieve_bm25(
-        query,
-        search_text=search_text,
-        k=k,
-        k_court=k_court,
-        k_law=k_law,
-        weight_extracted=weight_extracted,
-        weight_law=weight_law,
-        weight_court=weight_court,
-        rrf_k=rrf_k,
+
+    extracted, bm25_court, bm25_law = retrieve_bm25_parts(
+        query, search_text, k_court, k_law
     )
+
+    rankings: list[tuple[list[str], float]] = [
+        (extracted,   weight_extracted),
+        (bm25_court,  weight_bm25_court),
+        (bm25_law,    weight_bm25_law),
+    ]
+
+    if _USE_DENSE_COURT or _USE_DENSE_LAW:
+        dense_court, dense_law = retrieve_dense_parts(
+            query,
+            k_court=k_court,
+            k_law=k_law,
+            use_court=_USE_DENSE_COURT,
+            use_law=_USE_DENSE_LAW,
+        )
+        if _USE_DENSE_COURT and dense_court:
+            rankings.append((dense_court, weight_dense_court))
+        if _USE_DENSE_LAW and dense_law:
+            rankings.append((dense_law, weight_dense_law))
+
+    return weighted_rrf(rankings, rrf_k=rrf_k)[:k]
 
 
 def format_citations(citations: list[str]) -> str:
@@ -113,8 +146,10 @@ def _process_query(
     k_court: int,
     k_law: int,
     weight_extracted: float,
-    weight_law: float,
-    weight_court: float,
+    weight_bm25_court: float,
+    weight_bm25_law: float,
+    weight_dense_court: float,
+    weight_dense_law: float,
     rrf_k: int,
 ) -> tuple[str, str]:
     qid = row["query_id"]
@@ -127,8 +162,10 @@ def _process_query(
         k_court=k_court,
         k_law=k_law,
         weight_extracted=weight_extracted,
-        weight_law=weight_law,
-        weight_court=weight_court,
+        weight_bm25_court=weight_bm25_court,
+        weight_bm25_law=weight_bm25_law,
+        weight_dense_court=weight_dense_court,
+        weight_dense_law=weight_dense_law,
         rrf_k=rrf_k,
     )
     return qid, format_citations(citations)
@@ -141,8 +178,10 @@ def run(
     k_court: int,
     k_law: int,
     weight_extracted: float,
-    weight_law: float,
-    weight_court: float,
+    weight_bm25_court: float,
+    weight_bm25_law: float,
+    weight_dense_court: float,
+    weight_dense_law: float,
     rrf_k: int,
     use_rewrite: bool = True,
     rewrite_log_dir: str | None = None,
@@ -154,7 +193,10 @@ def run(
         print(f"Wrote 0 predictions → {output_path}", file=sys.stderr)
         return
 
-    _load_index()
+    _load_bm25_index()
+    if _USE_DENSE_COURT or _USE_DENSE_LAW:
+        _load_dense_index(use_court=_USE_DENSE_COURT, use_law=_USE_DENSE_LAW)
+
     process_kwargs = {
         "use_rewrite": use_rewrite,
         "rewrite_log_dir": rewrite_log_dir,
@@ -162,8 +204,10 @@ def run(
         "k_court": k_court,
         "k_law": k_law,
         "weight_extracted": weight_extracted,
-        "weight_law": weight_law,
-        "weight_court": weight_court,
+        "weight_bm25_court": weight_bm25_court,
+        "weight_bm25_law": weight_bm25_law,
+        "weight_dense_court": weight_dense_court,
+        "weight_dense_law": weight_dense_law,
         "rrf_k": rrf_k,
     }
 
@@ -191,14 +235,21 @@ def run(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run query pipeline and write predictions CSV")
-    parser.add_argument("--input", default=DEFAULT_INPUT, help="Input query CSV")
+    parser.add_argument("--input",  default=DEFAULT_INPUT,  help="Input query CSV")
     parser.add_argument("--output", default=DEFAULT_OUTPUT, help="Output predictions CSV")
     parser.add_argument("--k-court", type=int, default=300)
-    parser.add_argument("--k-law", type=int, default=300)
-    parser.add_argument("--k", type=int, default=200, help="RRF output top-k")
-    parser.add_argument("--weight-extracted", type=float, default=2.0)
-    parser.add_argument("--weight-law", type=float, default=1.2)
-    parser.add_argument("--weight-court", type=float, default=1.0)
+    parser.add_argument("--k-law",   type=int, default=300)
+    parser.add_argument("--k",       type=int, default=200, help="RRF output top-k")
+    parser.add_argument("--weight-extracted",   type=float, default=2.0)
+    parser.add_argument("--weight-bm25-court",  type=float, default=1.0)
+    parser.add_argument("--weight-bm25-law",    type=float, default=1.2)
+    parser.add_argument("--weight-dense-court", type=float, default=1.0)
+    parser.add_argument("--weight-dense-law",   type=float, default=1.2)
+    # deprecated aliases
+    parser.add_argument("--weight-court", type=float, default=None,
+                        help="Deprecated alias for --weight-bm25-court")
+    parser.add_argument("--weight-law",   type=float, default=None,
+                        help="Deprecated alias for --weight-bm25-law")
     parser.add_argument("--rrf-k", type=int, default=60)
     parser.add_argument("--no-rewrite", action="store_true", help="Skip LLM query rewrite")
     parser.add_argument(
@@ -220,6 +271,10 @@ def main() -> None:
     args = parser.parse_args()
     if args.workers < 1:
         parser.error("--workers must be >= 1")
+
+    weight_bm25_court = args.weight_court if args.weight_court is not None else args.weight_bm25_court
+    weight_bm25_law   = args.weight_law   if args.weight_law   is not None else args.weight_bm25_law
+
     run(
         args.input,
         args.output,
@@ -227,8 +282,10 @@ def main() -> None:
         k_court=args.k_court,
         k_law=args.k_law,
         weight_extracted=args.weight_extracted,
-        weight_law=args.weight_law,
-        weight_court=args.weight_court,
+        weight_bm25_court=weight_bm25_court,
+        weight_bm25_law=weight_bm25_law,
+        weight_dense_court=args.weight_dense_court,
+        weight_dense_law=args.weight_dense_law,
         rrf_k=args.rrf_k,
         use_rewrite=not args.no_rewrite,
         rewrite_log_dir=None if args.no_rewrite_log else args.rewrite_log,

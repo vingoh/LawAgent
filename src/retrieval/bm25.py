@@ -65,18 +65,18 @@ def _load_index() -> None:
     )
 
 
-def retrieve_bm25(
+def retrieve_bm25_parts(
     query: str,
     search_text: str | None = None,
-    k: int = 700,
     k_court: int = 300,
     k_law: int = 300,
-    weight_extracted: float = 2.0,
-    weight_law: float = 1.2,
-    weight_court: float = 1.0,
-    rrf_k: int = 60,
-) -> list[str]:
-    """Return up to k citation strings via dual BM25 + query extraction RRF fusion."""
+) -> tuple[list[str], list[str], list[str]]:
+    """Return (extracted, court_citations, law_citations) without RRF fusion.
+
+    extracted        — citations literally present in the query text
+    court_citations  — BM25 court results, ranked by BM25 score
+    law_citations    — BM25 law results, ranked by BM25 score
+    """
     _load_index()
 
     extracted = extract_citations_from_query(query)
@@ -93,7 +93,26 @@ def retrieve_bm25(
     )
 
     court_citations = [_corpus_court[i]["citation"] for i in court_results[0].tolist()]
-    law_citations = [_corpus_law[i]["citation"] for i in law_results[0].tolist()]
+    law_citations   = [_corpus_law[i]["citation"]   for i in law_results[0].tolist()]
+
+    return extracted, court_citations, law_citations
+
+
+def retrieve_bm25(
+    query: str,
+    search_text: str | None = None,
+    k: int = 700,
+    k_court: int = 300,
+    k_law: int = 300,
+    weight_extracted: float = 2.0,
+    weight_law: float = 1.2,
+    weight_court: float = 1.0,
+    rrf_k: int = 60,
+) -> list[str]:
+    """Return up to k citation strings via dual BM25 + query extraction RRF fusion."""
+    extracted, court_citations, law_citations = retrieve_bm25_parts(
+        query, search_text, k_court, k_law
+    )
 
     rankings: list[tuple[list[str], float]] = []
     if extracted:
