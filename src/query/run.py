@@ -23,8 +23,9 @@ from retrieval.dense import (
     dense_law_exists,
     retrieve_dense_parts,
 )
-from retrieval.rerank import _load_reranker, rerank, reranker_exists
+from retrieval.rerank import _load_reranker, rerank_with_scores, reranker_exists
 from retrieval.rrf import weighted_rrf
+from retrieval.selector import run_selector
 
 ROOT_DIR    = os.path.join(os.path.dirname(__file__), "../..")
 DATASET_DIR = os.path.join(ROOT_DIR, "dataset")
@@ -45,6 +46,9 @@ def _print_run_config(
     use_rerank: bool,
     rerank_top_k: int,
     rerank_batch_size: int,
+    use_select: bool,
+    use_llm_verify: bool,
+    verifier_top_k: int,
 ) -> None:
     print("Run configuration:", file=sys.stderr)
     print(f"  ROOT_DIR                = {ROOT_DIR}", file=sys.stderr)
@@ -55,6 +59,7 @@ def _print_run_config(
     print(f"  dense_court             = {_USE_DENSE_COURT}", file=sys.stderr)
     print(f"  dense_law               = {_USE_DENSE_LAW}", file=sys.stderr)
     print(f"  reranker                = {_USE_RERANK and use_rerank} (top_k={rerank_top_k}, batch={rerank_batch_size})", file=sys.stderr)
+    print(f"  selector                = {use_select} (llm_verify={use_llm_verify}, verifier_top_k={verifier_top_k})", file=sys.stderr)
     print(f"  input (actual)          = {input_path}", file=sys.stderr)
     print(f"  output (actual)         = {output_path}", file=sys.stderr)
     print(f"  use_rewrite             = {use_rewrite}", file=sys.stderr)
@@ -90,6 +95,9 @@ def predict_citations(
     use_rerank: bool = True,
     rerank_top_k: int = 100,
     rerank_batch_size: int = 32,
+    use_select: bool = True,
+    use_llm_verify: bool = True,
+    verifier_top_k: int = 60,
     query_id: str | None = None,
     rewrite_log_dir: str | None = None,
     k: int = 700,
@@ -105,35 +113,32 @@ def predict_citations(
     weight_court: float | None = None,
     weight_law: float | None = None,
 ) -> list[str]:
-    """Query pipeline: optional LLM rewrite + 5-way weighted RRF fusion + optional reranker."""
+    """Query pipeline: optional LLM rewrite + 5-way weighted RRF + optional reranker + selector."""
     if weight_court is not None:
         weight_bm25_court = weight_court
     if weight_law is not None:
         weight_bm25_law = weight_law
 
     search_text = None
+    rewrite_result = None
     llm_articles: list[str] = []
     if use_rewrite:
         rewrite_result = rewrite_query(query)
         search_text = format_search_text(rewrite_result, lang="de")
         llm_articles = rewrite_result.expected_articles
-        # Append predicted article citations as plain text so BM25 text tokens
-        # ("art", "314", "stgb" etc.) also match corpus documents that mention them.
         if llm_articles:
             search_text = search_text + " " + " ".join(llm_articles)
         if rewrite_log_dir and query_id:
             _log_rewrite(rewrite_log_dir, query_id, query, rewrite_result, search_text)
 
     extracted, bm25_court, bm25_law = retrieve_bm25_parts(
-        query, search_text, k_court, k_law
+        query, search_text, k_court, k_law,
+        extra_citations=llm_articles or None,
     )
 
-    # Merge LLM-predicted articles into the extracted channel (weight_extracted).
-    # LLM articles go first; query-literal citations follow; duplicates removed.
     if llm_articles:
-        seen: set[str] = set(extracted)
-        merged = [a for a in llm_articles if a not in seen]
-        seen.update(merged)
+        seen: set[str] = set(llm_articles)
+        merged = list(llm_articles)
         merged.extend(c for c in extracted if c not in seen)
         extracted = merged
 
@@ -143,10 +148,9 @@ def predict_citations(
         (bm25_law,    weight_bm25_law),
     ]
 
+    dense_court: list[str] = []
+    dense_law: list[str] = []
     if _USE_DENSE_COURT or _USE_DENSE_LAW:
-        # Encode the German search_text rather than the raw English query so that
-        # dense cosine similarity is computed in the same language as the indexed
-        # court/law documents, reducing cross-lingual noise.
         dense_query = search_text if search_text is not None else query
         dense_court, dense_law = retrieve_dense_parts(
             dense_query,
@@ -160,21 +164,47 @@ def predict_citations(
         if _USE_DENSE_LAW and dense_law:
             rankings.append((dense_law, weight_dense_law))
 
-    rrf_result = weighted_rrf(rankings, rrf_k=rrf_k)
+    rrf_result, rrf_scores = weighted_rrf(rankings, rrf_k=rrf_k)
 
     if use_rerank and _USE_RERANK:
         rerank_query = query
         if search_text is not None:
             rerank_query = query + " " + search_text
-        rrf_result = rerank(
+        scored = rerank_with_scores(
             rerank_query,
             rrf_result,
             corpus.get_corpus_texts(),
             top_k=rerank_top_k,
             batch_size=rerank_batch_size,
         )
+    else:
+        # No reranker: use rrf_scores as proxy, convert to scored list
+        scored = [(cit, rrf_scores.get(cit, 0.0)) for cit in rrf_result[:rerank_top_k]]
 
-    return rrf_result[:k]
+    if use_select:
+        source_rankings: dict[str, list[str]] = {
+            "extracted": extracted,
+            "bm25_court": bm25_court,
+            "bm25_law": bm25_law,
+        }
+        if _USE_DENSE_COURT and dense_court:
+            source_rankings["dense_court"] = dense_court
+        if _USE_DENSE_LAW and dense_law:
+            source_rankings["dense_law"] = dense_law
+
+        return run_selector(
+            query,
+            rewrite_result,
+            scored,
+            rrf_scores,
+            source_rankings,
+            corpus.get_corpus_texts(),
+            use_llm_verify=use_llm_verify,
+            verifier_top_k=verifier_top_k,
+        )
+
+    # Fallback: no selector — return flat reranked list truncated to k
+    return [cit for cit, _ in scored][:k]
 
 
 def format_citations(citations: list[str]) -> str:
@@ -209,6 +239,9 @@ def _process_query(
     use_rerank: bool,
     rerank_top_k: int,
     rerank_batch_size: int,
+    use_select: bool,
+    use_llm_verify: bool,
+    verifier_top_k: int,
     rewrite_log_dir: str | None,
     k: int,
     k_court: int,
@@ -227,6 +260,9 @@ def _process_query(
         use_rerank=use_rerank,
         rerank_top_k=rerank_top_k,
         rerank_batch_size=rerank_batch_size,
+        use_select=use_select,
+        use_llm_verify=use_llm_verify,
+        verifier_top_k=verifier_top_k,
         query_id=qid,
         rewrite_log_dir=rewrite_log_dir,
         k=k,
@@ -258,6 +294,9 @@ def run(
     use_rerank: bool = True,
     rerank_top_k: int = 100,
     rerank_batch_size: int = 32,
+    use_select: bool = True,
+    use_llm_verify: bool = True,
+    verifier_top_k: int = 60,
     rewrite_log_dir: str | None = None,
     workers: int = 4,
 ) -> None:
@@ -269,6 +308,9 @@ def run(
         use_rerank=use_rerank,
         rerank_top_k=rerank_top_k,
         rerank_batch_size=rerank_batch_size,
+        use_select=use_select,
+        use_llm_verify=use_llm_verify,
+        verifier_top_k=verifier_top_k,
     )
     queries = load_queries(input_path)
     if not queries:
@@ -288,6 +330,9 @@ def run(
         "use_rerank": use_rerank,
         "rerank_top_k": rerank_top_k,
         "rerank_batch_size": rerank_batch_size,
+        "use_select": use_select,
+        "use_llm_verify": use_llm_verify,
+        "verifier_top_k": verifier_top_k,
         "rewrite_log_dir": rewrite_log_dir,
         "k": k,
         "k_court": k_court,
@@ -348,6 +393,22 @@ def main() -> None:
     parser.add_argument("--rerank-batch-size", type=int, default=32,
                         help="Reranker inference batch size (default: 32)")
     parser.add_argument(
+        "--no-select",
+        action="store_true",
+        help="Disable selector pipeline; fall back to plain reranked[:k] output",
+    )
+    parser.add_argument(
+        "--no-llm-verify",
+        action="store_true",
+        help="Run selector without LLM verifier (cheap expand + score fusion only)",
+    )
+    parser.add_argument(
+        "--verifier-top-k",
+        type=int,
+        default=60,
+        help="Number of candidates shown to LLM verifier (default: 60)",
+    )
+    parser.add_argument(
         "--rewrite-log",
         default=DEFAULT_REWRITE_LOG_DIR,
         help=f"Directory for per-query rewrite JSON logs (default: {DEFAULT_REWRITE_LOG_DIR})",
@@ -386,6 +447,9 @@ def main() -> None:
         use_rerank=not args.no_rerank,
         rerank_top_k=args.rerank_top_k,
         rerank_batch_size=args.rerank_batch_size,
+        use_select=not args.no_select,
+        use_llm_verify=not args.no_llm_verify,
+        verifier_top_k=args.verifier_top_k,
         rewrite_log_dir=None if args.no_rewrite_log else args.rewrite_log,
         workers=args.workers,
     )

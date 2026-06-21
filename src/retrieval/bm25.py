@@ -9,18 +9,18 @@ import bm25s
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from indexing.bm25_tokenize import tokenize_for_bm25
 from retrieval import corpus as _corpus_mod
-from retrieval.rrf import weighted_rrf
 
 ROOT_DIR    = os.path.join(os.path.dirname(__file__), "../..")
 INDEX_DIR   = os.path.join(ROOT_DIR, "indexes")
 BM25_COURT_DIR = os.path.join(INDEX_DIR, "bm25_court")
 BM25_LAW_DIR   = os.path.join(INDEX_DIR, "bm25_law")
 
+_NUM = r'\d+(?:bis|ter|quater|[a-z])?'   # 共用组件：数字 + 可选后缀
 STATUTE_RE = re.compile(
-    r'Art\.\s*\d+(?:\s+Abs\.\s*\d+(?:\s+lit\.\s*\w+)?)?'
-    r'(?:\s+[A-Z][A-Za-z]+)+',
+    r'Art\.\s*' + _NUM + r'(?:\s+Abs\.\s*' + _NUM + r'(?:\s+lit\.\s*\w+)?)?'
+    r'(?:\s+[A-Z][A-Za-z]+)+'
 )
-BGE_RE  = re.compile(r'BGE\s+\d+\s+[IVX]+\s+\d+(?:\s+E\.\s*[\d.]+)?')
+BGE_RE  = re.compile(r'BGE\s+\d+\s+[IVX]+\s+\d+(?:\s+E\.\s*[\d.a-zA-Z]+)?')
 BGER_RE = re.compile(r'\d[A-Z]_\d+/\d{4}(?:\s+E\.\s*[\d.a-zA-Z]+)?')
 
 _retriever_court: bm25s.BM25 | None = None
@@ -66,19 +66,30 @@ def retrieve_bm25_parts(
     search_text: str | None = None,
     k_court: int = 300,
     k_law: int = 300,
+    extra_citations: list[str] | None = None,
 ) -> tuple[list[str], list[str], list[str]]:
     """Return (extracted, court_citations, law_citations) without RRF fusion.
 
     extracted        — citations literally present in the query text
     court_citations  — BM25 court results, ranked by BM25 score
     law_citations    — BM25 law results, ranked by BM25 score
+    extra_citations  — additional citations (e.g. LLM-predicted) to inject as
+                       atomic citation tokens into the query, without affecting
+                       the returned ``extracted`` list
     """
     _load_index()
 
     extracted = extract_citations_from_query(query)
     text_for_search = search_text if search_text is not None else query
+
+    # Merge extra_citations (e.g. LLM predictions) with query-literal citations
+    # so they are all converted to atomic citation tokens by tokenize_for_bm25,
+    # enabling exact citation-token matching against the indexed corpus.
+    extracted_set = set(extracted)
+    all_citations = extracted + [c for c in (extra_citations or []) if c not in extracted_set]
+
     tokenized_q = tokenize_for_bm25(
-        [text_for_search], citations=[extracted], show_progress=False
+        [text_for_search], citations=[all_citations], show_progress=False
     )
 
     court_results, _ = _retriever_court.retrieve(
@@ -92,31 +103,3 @@ def retrieve_bm25_parts(
     law_citations   = [_corpus_law[i]["citation"]   for i in law_results[0].tolist()]
 
     return extracted, court_citations, law_citations
-
-
-def retrieve_bm25(
-    query: str,
-    search_text: str | None = None,
-    k: int = 700,
-    k_court: int = 300,
-    k_law: int = 300,
-    weight_extracted: float = 2.0,
-    weight_law: float = 1.2,
-    weight_court: float = 1.0,
-    rrf_k: int = 60,
-) -> list[str]:
-    """Return up to k citation strings via dual BM25 + query extraction RRF fusion."""
-    extracted, court_citations, law_citations = retrieve_bm25_parts(
-        query, search_text, k_court, k_law
-    )
-
-    rankings: list[tuple[list[str], float]] = []
-    if extracted:
-        rankings.append((extracted, weight_extracted))
-    if court_citations:
-        rankings.append((court_citations, weight_court))
-    if law_citations:
-        rankings.append((law_citations, weight_law))
-
-    fused = weighted_rrf(rankings, rrf_k=rrf_k)
-    return fused[:k]

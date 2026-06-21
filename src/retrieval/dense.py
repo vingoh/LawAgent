@@ -69,6 +69,16 @@ def _load_index(use_court: bool = True, use_law: bool = True) -> None:
 
     _corpus_court = _corpus_mod.get_corpus_court()
     _corpus_law   = _corpus_mod.get_corpus_law()
+    if _index_court is not None and _index_court.ntotal != len(_corpus_court):
+        raise RuntimeError(
+            f"dense_court: FAISS index has {_index_court.ntotal:,} vectors "
+            f"but corpus has {len(_corpus_court):,} docs — rebuild the index."
+        )
+    if _index_law is not None and _index_law.ntotal != len(_corpus_law):
+        raise RuntimeError(
+            f"dense_law: FAISS index has {_index_law.ntotal:,} vectors "
+            f"but corpus has {len(_corpus_law):,} docs — rebuild the index."
+        )
     _loaded = True
 
 

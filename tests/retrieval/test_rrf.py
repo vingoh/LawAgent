@@ -7,32 +7,33 @@ from retrieval.rrf import weighted_rrf
 
 
 def test_single_ranking():
-    rankings = [(["a", "b", "c"], 1.0)]
-    assert weighted_rrf(rankings, rrf_k=60) == ["a", "b", "c"]
+    result, scores = weighted_rrf([( ["a", "b", "c"], 1.0)], rrf_k=60)
+    assert result == ["a", "b", "c"]
+    assert set(scores.keys()) == {"a", "b", "c"}
+    assert scores["a"] > scores["b"] > scores["c"]
 
 
 def test_multi_ranking_accumulates():
-    rankings = [
-        (["a", "b"], 1.0),
-        (["b", "c"], 1.0),
-    ]
-    result = weighted_rrf(rankings, rrf_k=60)
+    result, scores = weighted_rrf(
+        [(["a", "b"], 1.0), (["b", "c"], 1.0)], rrf_k=60
+    )
     assert result[0] == "b"
     assert set(result) == {"a", "b", "c"}
 
 
 def test_weighted_ranking():
-    rankings = [
-        (["a"], 1.0),
-        (["b"], 3.0),
-    ]
-    result = weighted_rrf(rankings, rrf_k=60)
+    result, scores = weighted_rrf(
+        [(["a"], 1.0), (["b"], 3.0)], rrf_k=60
+    )
     assert result[0] == "b"
 
 
 def test_empty_rankings():
-    assert weighted_rrf([], rrf_k=60) == []
+    result, scores = weighted_rrf([], rrf_k=60)
+    assert result == []
+    assert scores == {}
 
 
 def test_empty_single_list():
-    assert weighted_rrf([([], 1.0), (["a"], 1.0)], rrf_k=60) == ["a"]
+    result, scores = weighted_rrf([([], 1.0), (["a"], 1.0)], rrf_k=60)
+    assert result == ["a"]
