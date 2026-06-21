@@ -83,3 +83,30 @@ def test_rewrite_query_calls_llm_and_parses():
     system_prompt, user_prompt = mock_chat.call_args[0]
     assert "JSON" in system_prompt
     assert "Can a party rescind a contract?" in user_prompt
+
+
+def test_rewrite_query_retries_on_failure():
+    mock_data = {
+        "legal_issue": "Test Issue",
+        "expected_codes": ["OR"],
+        "search_terms": {"de": ["Term A"], "fr": []},
+    }
+    with patch(
+        "query.rewrite.chat_json",
+        side_effect=[RuntimeError("API error"), mock_data],
+    ) as mock_chat:
+        result = rewrite_query("test query")
+
+    assert result.legal_issue == "Test Issue"
+    assert mock_chat.call_count == 2
+
+
+def test_rewrite_query_raises_after_both_failures():
+    with patch(
+        "query.rewrite.chat_json",
+        side_effect=RuntimeError("API error"),
+    ) as mock_chat:
+        with pytest.raises(RuntimeError, match="API error"):
+            rewrite_query("test query")
+
+    assert mock_chat.call_count == 2

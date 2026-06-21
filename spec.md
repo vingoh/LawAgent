@@ -309,6 +309,375 @@ Final Output
 
 非 Agentic 的简化版本：Citation Selector 直接从 Round 1 候选中选择，无反馈循环。
 
+### 6.3 当前 Query Pipeline（已实现）
+
+入口：`src/query/run.py` → `predict_citations()`。以下数量以 **CLI 默认值** 为准（可通过参数覆盖）；带 `~` 的为 query 相关变量，`≤` 为硬上限。
+
+```mermaid
+flowchart TD
+    IN["输入 query<br/>1 条英文法律问题"] --> RW
+
+  subgraph rewrite ["① Query Rewrite（--no-rewrite 跳过）"]
+    RW["rewrite_query()"] --> RW_OUT["RewriteResult<br/>+ search_text（德文检索串）"]
+  end
+
+  RW_OUT --> BM25
+
+  subgraph retrieval ["② 多路检索"]
+    BM25["retrieve_bm25_parts()"] --> BM25_OUT["extracted ≤~5<br/>bm25_court ≤300<br/>bm25_law ≤300"]
+    BM25_OUT --> FILTER["语料校验 extracted"]
+    FILTER --> DENSE["retrieve_dense_parts()<br/>（索引存在时）"]
+    DENSE --> DENSE_OUT["dense_court ≤300<br/>dense_law ≤300"]
+  end
+
+  DENSE_OUT --> RRF
+
+  subgraph fusion ["③ 融合 + 精排"]
+    RRF["weighted_rrf()<br/>3~5 路加权"] --> RRF_OUT["rrf_result 去重并集<br/>通常 400~900 条<br/>rrf_scores: dict"]
+    RRF_OUT --> RERANK["rerank_with_scores()<br/>（--no-rerank 跳过）"]
+    RERANK --> RERANK_OUT["scored ≤100<br/>(citation, score)"]
+  end
+
+  RERANK_OUT --> SEL
+
+  subgraph selector ["④ Selector（--no-select 跳过）<br/>src/retrieval/selector.py"]
+    SEL["run_selector()"] --> BC["build_candidates()"]
+    BC --> BC_OUT["Candidate ≤100"]
+    BC_OUT --> CE["cheap_expand()"]
+    CE --> CE_OUT["Candidate ≤100+50<br/>（每路 rescue top-10）"]
+    CE_OUT --> LV["llm_verify()<br/>（--no-llm-verify 跳过）"]
+    LV --> LV_OUT["top-60 打 relevance 0~3<br/>n_LLM ∈ [1,100]"]
+    LV_OUT --> FS["fuse_scores()"]
+    FS --> AC["adaptive_count()"]
+    AC --> AC_OUT["n_final ∈ [3, 40]"]
+    AC_OUT --> ASM["assemble()"]
+    ASM --> ASM_OUT["citations ≥ n_final<br/>（direct_hit 可溢出）"]
+  end
+
+  RERANK_OUT -. "--no-select" .-> FALLBACK["reranked[:k]<br/>k 默认 200"]
+  ASM_OUT --> FMT["format_citations()<br/>分号分隔字符串"]
+  FALLBACK --> FMT
+  FMT --> OUT["输出 predicted_citations<br/>1 条/ query"]
+```
+
+#### 逐步输入 / 输出数量
+
+| 步骤 | 函数 | 输入 | 输出 | 默认参数 |
+|------|------|------|------|----------|
+| 0 | — | CSV 行 `{query_id, query}` | 1 条英文 query | — |
+| 1 | `rewrite_query()` | 1 query | `RewriteResult`：`legal_issue`(1)、`expected_codes`(0~)、`expected_articles`(0~10)、`search_terms.de`(5~10)、`search_terms.fr`(0~5)；`format_search_text()` → 德文检索串 | `--no-rewrite` 跳过 |
+| 2a | `retrieve_bm25_parts()` | query + search_text + `extra_citations`(LLM articles) | `extracted`：query 内正则抽取，通常 0~5；`bm25_court` ≤300；`bm25_law` ≤300 | `--k-court 300`、`--k-law 300` |
+| 2b | 语料校验 | `extracted` | 仅保留语料库中存在的 citation（~248 万条） | `corpus.get_corpus_texts()` |
+| 2c | `retrieve_dense_parts()` | search_text 或 query | `dense_court` ≤300、`dense_law` ≤300（索引存在时各一路） | 同 k_court / k_law |
+| 3 | `weighted_rrf()` | 3~5 路 `(ranking, weight)` 列表 | `rrf_result`：去重并集，通常 **400~900** 条；`rrf_scores`：同 key 的 float dict | `rrf_k=60`；权重 extracted=2.0, bm25_court=1.0, bm25_law=1.2, dense_court=0.6, dense_law=1.2 |
+| 4 | `rerank_with_scores()` | `rrf_result`、语料文本 | `scored`：**≤100** 个 `(citation, rerank_score∈[0,1])`，按分降序 | `--rerank-top-k 100` |
+| 5a | `build_candidates()` | `scored`、rrf_scores、source_rankings | **≤100** 个 `Candidate`（挂载 source_set / direct_regex_hit 等元数据） | — |
+| 5b | `cheap_expand()` | candidates + 各路 ranking | **≤100 + 50** 个 Candidate（每路 rescue 前 10 条未入池候选，`rerank_score=0`） | `rescue_top_k=10` |
+| 5c | `llm_verify()` | candidates、query、语料片段 | 同数量 candidates；**top-60** 填充 `relevance`(0~3)；返回 `n_LLM`（失败时默认 10） | `--verifier-top-k 60` |
+| 5d | `fuse_scores()` | candidates | 同数量，按 `final_score` 降序 | — |
+| 5e | `adaptive_count()` | candidates、`n_LLM` | 标量 `n_final` ∈ **[3, 40]**：`clamp(round(0.2·n_LLM + 0.4·n_elbow + 0.4·n_rel23))` | `min=3, max=40` |
+| 5f | `assemble()` | candidates、`n_final` | **≥ n_final** 条 citation 字符串（`direct_regex_hit` 可超出配额；BGE 同 parent ≤3；过滤非语料） | `max_per_parent=3` |
+| 6 | `format_citations()` | citation list | 1 条 `"; "`-分隔字符串 | — |
+
+#### 降级路径
+
+| 开关 | 行为 | 最终输出数量 |
+|------|------|--------------|
+| `--no-rewrite` | 跳过 LLM rewrite；检索直接用原始 query | — |
+| `--no-rerank` | 用 RRF 分代替 rerank 分，取 `rrf_result[:rerank_top_k]` | ≤100 |
+| `--no-select` | 跳过 selector，直接 `scored[:k]`（语料校验后） | **≤200**（`--k` 默认 200） |
+| `--no-llm-verify` | selector 内跳过 verifier；`n_LLM=10`，`n_rel23=0` | `n_final` 仍由 elbow 主导 |
+
+#### 语料规模（检索上限背景）
+
+| 索引 | 文档数 | 每路 top-k |
+|------|--------|------------|
+| BM25 court | ~247 万 | 300 |
+| BM25 law | ~1.5 万 | 300 |
+| Dense court / law | 同左 | 各 300 |
+| 合计语料 | ~248 万 canonical citations | — |
+
+#### 逐步详细说明
+
+以下按数据在 pipeline 中的实际流动顺序描述。凡未特别说明的，均指 `predict_citations()` 默认开启 rewrite + rerank + selector + llm_verify 的完整路径。
+
+**Step 0 — 批量入口与语料加载**
+
+`run()` 从 CSV 读取 `{query_id, query}` 行，每条 query 独立调用 `predict_citations()`。启动时一次性加载 BM25 索引、Dense 索引（若存在）、Reranker 模型，以及 `corpus.get_corpus_texts()`（`citation → indexed_text` 字典，约 248 万条）。多 query 时通过 `ThreadPoolExecutor` 并行处理（默认 4 worker）。
+
+---
+
+**Step 1 — Query Rewrite（`rewrite_query()`）**
+
+| | 内容 |
+|---|---|
+| **输入** | 原始英文 query（1 条字符串） |
+| **输出** | `RewriteResult` + 拼接后的 `search_text` |
+
+LLM 将 query 解析为结构化 JSON，字段含义如下：
+
+- `legal_issue`：核心法律问题的德文短语（1 条）
+- `expected_codes`：可能涉及的法典缩写列表（如 `StGB`、`OR`），用于后续 selector 的 `expected_code_match` 标记
+- `expected_articles`：LLM 预测的相关法条 citation（最多 10 条，如 `Art. 314 StGB`），**不**进入 `extracted` 通道
+- `search_terms.de` / `search_terms.fr`：德文 / 法文检索短语
+
+`format_search_text()` 将 `legal_issue` 与 `search_terms.de` 拼成德文检索串。若 `expected_articles` 非空，会**追加**到 `search_text` 末尾（仅影响 BM25 / Dense 的文本匹配，不改变 `extracted` 列表）。
+
+**额外输入注入（本步产生，下游使用）：**
+
+- `search_text` → 传给 BM25 与 Dense 作为主检索文本（替代或补充原始英文 query）
+- `expected_articles` → 作为 `extra_citations` 传给 BM25（见 Step 2），以 citation token 形式增强 BM25 查询，但**不计入** `extracted`
+- `RewriteResult` 整体 → 传给 selector 的 `llm_verify()` 作为上下文（`legal_issue`、`expected_codes`、`expected_articles`）
+
+`--no-rewrite` 时：`search_text=None`，BM25 / Dense 直接用原始 query；`expected_articles` 为空；selector 中 `query_info=None`。
+
+---
+
+**Step 2a — BM25 多路检索（`retrieve_bm25_parts()`）**
+
+| | 内容 |
+|---|---|
+| **输入** | 原始 `query`；`search_text`（rewrite 后德文串，或 None）；`extra_citations`（= `expected_articles`）；`k_court` / `k_law` |
+| **输出** | 三路独立排名列表：`(extracted, bm25_court, bm25_law)` |
+
+**extracted 通道（正则抽取，权重最高）：**
+
+从**原始 query 文本**中用正则抽取字面出现的 citation（不读 rewrite 结果）：
+
+- 法条：`Art. N [Abs. M] CODE`（`STATUTE_RE`）
+- BGE：`BGE vol div page [E. x.y.z]`（`BGE_RE`）
+- BGer 案件号：`\dA_\d+/\d{4}`（`BGER_RE`）
+
+返回顺序为首次匹配顺序，通常 0~5 条。此列表代表「query 中直接写出的引用」，在 selector 中标记为 `direct_regex_hit=True`，assemble 阶段可强制保留。
+
+**BM25 court / law 通道：**
+
+- 检索文本 = `search_text`（若存在）否则 `query`
+- 查询 tokenization 时，将 `extracted` 与 `extra_citations`（LLM 预测法条）合并为 **citation token** 附加在查询末尾（`citation_to_token()`：小写 + 非字母数字转下划线），使 BM25 能精确匹配语料中的 canonical citation
+- `extra_citations` 只影响 BM25 查询向量，**不**加入 `extracted` 返回值——因此 LLM 预测的法条不会获得 `direct_regex_hit`
+- 分别在 court 索引（~247 万）和 law 索引（~1.5 万）上各取 top `k_court` / `k_law`（默认 300），按 BM25 分降序
+
+---
+
+**Step 2b — extracted 语料校验**
+
+| | 内容 |
+|---|---|
+| **输入** | `extracted` 列表 |
+| **过滤规则** | 仅保留 `citation in corpus_texts` 的条目 |
+| **输出** | 过滤后的 `extracted`（幻觉或格式不在语料中的引用被丢弃） |
+
+注意：此步**仅过滤 extracted**，BM25 / Dense 返回的结果本身来自索引，默认已在语料中。后续 rerank 和 selector 另有语料校验。
+
+---
+
+**Step 2c — Dense 向量检索（`retrieve_dense_parts()`，索引存在时）**
+
+| | 内容 |
+|---|---|
+| **输入** | `search_text`（若存在）否则 `query`；`k_court` / `k_law` |
+| **输出** | `(dense_court, dense_law)`，各 ≤300 条 |
+
+使用 `bge-m3` 对查询编码，在 FAISS `IndexFlatIP` 上分别检索 court / law 语料。Dense 路**不**做 citation token 注入，纯语义匹配。若对应索引文件不存在，该路跳过，RRF 输入减少为 3 路。
+
+---
+
+**Step 3 — 加权 RRF 融合（`weighted_rrf()`）**
+
+| | 内容 |
+|---|---|
+| **输入** | 3~5 路 `(ranking_list, weight)` 元组 |
+| **输出** | `rrf_result`（去重后按融合分降序的全量列表）；`rrf_scores`（`citation → float` 字典） |
+
+各路及默认权重：
+
+| 路 | 来源 | 权重 |
+|----|------|------|
+| `extracted` | 正则抽取（语料校验后） | 2.0 |
+| `bm25_court` | BM25 判决考量 | 1.0 |
+| `bm25_law` | BM25 法条 | 1.2 |
+| `dense_court` | Dense 判决考量 | 0.6 |
+| `dense_law` | Dense 法条 | 1.2 |
+
+融合公式：对每路排名第 `r`（0-based）的 citation，`score += weight / (rrf_k + r + 1)`，默认 `rrf_k=60`。同一条 citation 出现在多路时分数累加。
+
+**重要：RRF 不做 top-k 截断**——输出为所有出现过的 citation 的去重并集（通常 400~900 条，取决于各路重叠度）。`--k` 参数**不**影响此步。
+
+空 ranking 或 weight=0 的路被跳过。
+
+---
+
+**Step 4 — Cross-encoder 精排（`rerank_with_scores()`）**
+
+| | 内容 |
+|---|---|
+| **输入** | `rrf_result`；rerank 查询串；`corpus_texts` |
+| **输出** | `scored`：≤ `rerank_top_k` 个 `(citation, rerank_score)`，按分降序 |
+
+**Rerank 查询串构造：** `query + " " + search_text`（rewrite 开启时），否则仅 `query`。将英文原题与德文检索词同时送入 cross-encoder（`bge-reranker-v2-m3`）。
+
+**截断与打分：**
+
+- 仅对 `rrf_result[:rerank_top_k]` 打分（默认前 100 条；你当前实验用 250）
+- 每条 candidate 取 `corpus_texts[citation]` 作为 passage；缺失语料的 citation 得 `0.0` 分，排在末尾
+- Sigmoid 后的分数 ∈ [0, 1]
+
+`--no-rerank` 时：不调 reranker，直接用 `rrf_scores` 作为分数，取 `rrf_result[:rerank_top_k]` 组成 `scored`。
+
+---
+
+**Step 5 — Selector Pipeline（`run_selector()`）**
+
+Selector 在 rerank 之后运行，负责扩展、语义验证、分数融合、自适应定量和约束选取。入口首先对 `scored` 做**语料过滤**：丢弃不在 `corpus_texts` 中的 citation。
+
+##### 5a. `build_candidates()` — 挂载元数据
+
+| | 内容 |
+|---|---|
+| **输入** | `scored`；`rrf_scores`；`source_rankings`（各路原始排名）；`query_info` |
+| **输出** | `list[Candidate]`，数量 = len(scored) |
+
+为每条 rerank 结果创建 `Candidate` dataclass，填充：
+
+| 字段 | 规则 |
+|------|------|
+| `rerank_score` / `rrf_score` | 直接来自 rerank 和 RRF |
+| `source_set` | citation 出现在哪些检索路（`extracted` / `bm25_court` / `bm25_law` / `dense_*`） |
+| `direct_regex_hit` | citation ∈ `source_rankings["extracted"]`（**仅** query 正则抽取，不含 LLM 预测法条） |
+| `expected_code_match` | citation 中的法典缩写 ∈ `query_info.expected_codes` |
+| `expansion_type` | 初始为 `None` |
+
+##### 5b. `cheap_expand()` — 确定性扩展
+
+| | 内容 |
+|---|---|
+| **输入** | candidates；`source_rankings`；`rrf_scores`；`query_info` |
+| **输出** | 扩展后的 candidates（原列表 + 新增 rescue 候选） |
+
+两阶段逻辑：
+
+**标记扩展（不新增候选）：** 在已有 rerank 池内，对非 seed 候选检查：
+
+- `same_parent`：与某 seed 共享 BGE parent（如 `BGE 145 IV 154`）
+- `same_code`：与某 seed 共享法典缩写（如 `StGB`）
+
+**Seed 定义：** `rerank_score ≥ 0.5` **或** `direct_regex_hit=True`。
+
+**Source diversity rescue（新增候选）：** 对 `source_rankings` 每一路的前 `rescue_top_k`（默认 10）条，若不在当前池中，则以 `rerank_score=0.0`、`expansion_type="{source}_rescue"` 追加。最多新增 5 路 × 10 = 50 条。Rescue 候选在 assemble 时若 `rerank_score < 0.1` 会被剔除。
+
+##### 5c. `llm_verify()` — LLM 相关性打分
+
+| | 内容 |
+|---|---|
+| **输入** | 全部 candidates；原始 `query`；`query_info`；`corpus_texts`；`verifier_top_k` |
+| **输出** | 同列表（top-k 填充 `relevance` / `llm_reason`）；标量 `n_LLM` |
+
+**送入 LLM 的范围：** 按 `rerank_score` 降序取前 `verifier_top_k` 条（默认 60；你当前实验用 100）。每条附带 citation、语料文本前 300 字符、rerank 分、`direct_hit` 标记。
+
+**LLM 输出：**
+
+- 每条候选 `relevance`：0（无关）/ 1（弱相关）/ 2（有用支持）/ 3（直接回答）
+- `estimated_answer_count`：LLM 估计回答问题所需 citation 总数 → `n_LLM`（限制在 [1, 100]；解析失败默认 10）
+
+**未打分的候选：** 排名在 `verifier_top_k` 之后的，`relevance=None`。
+
+**失败降级：** 最多重试 2 次；全部失败则所有 `relevance=None`，`n_LLM=10`。
+
+`--no-llm-verify` 时：跳过本步，`n_LLM=10`，全部 `relevance=None`。
+
+##### 5d. `fuse_scores()` — 多信号融合
+
+| | 内容 |
+|---|---|
+| **输入** | candidates（含 relevance） |
+| **输出** | 同数量 candidates，按 `final_score` 降序排列 |
+
+```
+final_score = rerank_score + llm_boost + rule_boost
+```
+
+**LLM boost（`relevance` 为 None 时 = 0）：**
+
+| relevance | boost |
+|-----------|-------|
+| 0 | −0.40 |
+| 1 | −0.10 |
+| 2 | +0.15 |
+| 3 | +0.35 |
+
+**Rule boost（可叠加）：**
+
+| 条件 | boost |
+|------|-------|
+| `direct_regex_hit` | +0.25 |
+| `expected_code_match` | +0.06 |
+| `source_set` 含 ≥2 路 | +0.04 |
+| `expansion_type == "same_parent"` | +0.03 |
+| `expansion_type == "same_code"` | +0.02 |
+| `expansion_type` 以 `_rescue` 结尾 | −0.05 |
+| `direct_regex_hit` 且有 `expansion_type` | −0.05（额外抵消：direct hit 但 rerank 排名低） |
+
+##### 5e. `adaptive_count()` — 自适应输出数量
+
+| | 内容 |
+|---|---|
+| **输入** | fuse 后的 candidates；`n_LLM` |
+| **输出** | 整数 `n_final` ∈ [3, 40] |
+
+```
+n_elbow  = Kneedle(final_score 降序曲线拐点)
+n_rel23  = count(relevance ∈ {2, 3})   # 全部 candidates，不仅 top-k
+n_final  = clamp(round(0.2·n_LLM + 0.4·n_elbow + 0.4·n_rel23), 3, 40)
+```
+
+- `n_LLM`：LLM 全局复杂度估计（权重 0.2）
+- `n_elbow`：`final_score` 曲线的结构拐点（权重 0.4）
+- `n_rel23`：LLM 逐条判定为相关（2/3）的数量（权重 0.4）
+
+verifier 跳过或失败时 `n_rel23=0`，公式退化为 `0.2·10 + 0.4·n_elbow`。
+
+##### 5f. `assemble()` — 约束选取
+
+| | 内容 |
+|---|---|
+| **输入** | candidates（已按 `final_score` 排序）；`n_final`；`valid_citations`（语料集） |
+| **输出** | `list[str]` citation 字符串 |
+
+按顺序执行四步过滤与选取：
+
+1. **Rescue 质量过滤：** `expansion_type` 以 `_rescue` 结尾 且 `rerank_score < 0.1` → 丢弃
+2. **语料校验：** 不在 `valid_citations`（= 语料集）中的 → 丢弃
+3. **去重：** 同一 citation 保留 `final_score` 最高的一次（首次出现）
+4. **配额选取 + 溢出：**
+   - 按 `final_score` 顺序取前 `n_final` 条
+   - BGE 同 parent（案件级）最多 `max_per_parent=3` 条考量
+   - 超出 `n_final` 配额但 `direct_regex_hit=True` 的 citation **强制追加**（overflow）
+
+所有输出 citation 必须来自候选池，不生成新引用。
+
+---
+
+**Step 6 — 格式化与写出**
+
+| | 内容 |
+|---|---|
+| **输入** | `list[str]` citations |
+| **输出** | 单条 `"; "` 分隔字符串，写入 CSV 的 `predicted_citations` 列 |
+
+`format_citations()` 不做额外过滤或排序。
+
+---
+
+**降级路径：`--no-select`**
+
+跳过整个 selector（Step 5），直接返回 `scored` 中在语料内的前 `k` 条（默认 `k=200`），无自适应数量、无 LLM 验证、无 cheap_expand。
+
+---
+
+**Rewrite 日志（可选）**
+
+`--rewrite-log` 开启时，每条 query 的 rewrite 结果写入 `results/rewrite_logs/{query_id}.json`，含 `legal_issue`、`expected_codes`、`expected_articles`、`search_terms`、`search_text`，供调试分析，不影响 pipeline 输出。
+
 ---
 
 ## 7. 模块设计

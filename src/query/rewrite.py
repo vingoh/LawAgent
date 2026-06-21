@@ -103,12 +103,24 @@ def format_search_text(result: RewriteResult, lang: str = "de") -> str:
 
 
 def rewrite_query(query: str) -> RewriteResult:
-    data = chat_json(SYSTEM_PROMPT, query)
-    if not isinstance(data, dict):
-        raise ValueError(f"LLM response must be a JSON object, got: {type(data)}")
-    try:
-        return parse_rewrite_result(data)
-    except ValueError as exc:
-        raise ValueError(
-            f"Invalid rewrite schema: {exc}\nRaw JSON: {json.dumps(data, ensure_ascii=False)}"
-        ) from exc
+    """Rewrite query via LLM. Retries once on API/parse failure."""
+    last_exc: Exception | None = None
+    for attempt in range(2):
+        try:
+            data = chat_json(SYSTEM_PROMPT, query)
+            if not isinstance(data, dict):
+                raise ValueError(f"LLM response must be a JSON object, got: {type(data)}")
+            try:
+                return parse_rewrite_result(data)
+            except ValueError as exc:
+                raise ValueError(
+                    f"Invalid rewrite schema: {exc}\n"
+                    f"Raw JSON: {json.dumps(data, ensure_ascii=False)}"
+                ) from exc
+        except Exception as exc:
+            last_exc = exc
+            print(f"[rewrite_query] attempt {attempt + 1} failed: {exc}", file=sys.stderr)
+
+    print("[rewrite_query] both attempts failed", file=sys.stderr)
+    assert last_exc is not None
+    raise last_exc

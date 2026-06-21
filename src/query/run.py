@@ -136,11 +136,8 @@ def predict_citations(
         extra_citations=llm_articles or None,
     )
 
-    if llm_articles:
-        seen: set[str] = set(llm_articles)
-        merged = list(llm_articles)
-        merged.extend(c for c in extracted if c not in seen)
-        extracted = merged
+    corpus_texts = corpus.get_corpus_texts()
+    extracted = [c for c in extracted if c in corpus_texts]
 
     rankings: list[tuple[list[str], float]] = [
         (extracted,   weight_extracted),
@@ -173,7 +170,7 @@ def predict_citations(
         scored = rerank_with_scores(
             rerank_query,
             rrf_result,
-            corpus.get_corpus_texts(),
+            corpus_texts,
             top_k=rerank_top_k,
             batch_size=rerank_batch_size,
         )
@@ -198,13 +195,13 @@ def predict_citations(
             scored,
             rrf_scores,
             source_rankings,
-            corpus.get_corpus_texts(),
+            corpus_texts,
             use_llm_verify=use_llm_verify,
             verifier_top_k=verifier_top_k,
         )
 
     # Fallback: no selector — return flat reranked list truncated to k
-    return [cit for cit, _ in scored][:k]
+    return [cit for cit, _ in scored if cit in corpus_texts][:k]
 
 
 def format_citations(citations: list[str]) -> str:

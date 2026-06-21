@@ -199,8 +199,8 @@ For each candidate assign a relevance score:
 Provide a brief reason (1 sentence in English).
 
 Also provide estimated_answer_count: how many total citations would be needed to \
-fully answer the legal question. Simple questions need fewer citations (e.g. 3-5), \
-questions with multiple independent legal sub-issues need more (e.g. 10-20).
+fully answer the legal question. Simple questions need fewer citations (e.g. 10-20), \
+questions with multiple independent legal sub-issues need more (e.g. 20-40).
 
 STRICT RULES:
 - You MUST score ALL candidates — the output list must have exactly the same count as input
@@ -355,6 +355,7 @@ def adaptive_count(
     n_elbow = _elbow(scores)
     n_rel23 = sum(1 for c in candidates if c.relevance in (2, 3))
     raw = round(0.2 * n_llm + 0.4 * n_elbow + 0.4 * n_rel23)
+    print(f"n_llm: {n_llm}, n_elbow: {n_elbow}, n_rel23: {n_rel23}, raw: {raw}")
     return max(min_val, min(max_val, raw))
 
 
@@ -364,6 +365,7 @@ def assemble(
     *,
     max_per_parent: int = 3,
     rescue_score_floor: float = 0.1,
+    valid_citations: set[str] | None = None,
 ) -> list[str]:
     """Select final citation list from scored candidates.
 
@@ -384,6 +386,8 @@ def assemble(
             and c.rerank_score < rescue_score_floor
         )
     ]
+    if valid_citations is not None:
+        filtered = [c for c in filtered if c.citation in valid_citations]
 
     # Step 2: dedup (keep highest final_score occurrence = first in sorted list)
     seen: set[str] = set()
@@ -438,6 +442,9 @@ def run_selector(
     rescue_score_floor: float = 0.1,
 ) -> list[str]:
     """Run the full selector pipeline and return the final citation list."""
+    valid = set(corpus_texts)
+    scored = [(c, s) for c, s in scored if c in valid]
+
     candidates = build_candidates(scored, rrf_scores, source_rankings, query_info)
     candidates = cheap_expand(
         candidates, source_rankings, rrf_scores, query_info,
@@ -461,4 +468,5 @@ def run_selector(
         candidates, n_final,
         max_per_parent=max_per_parent,
         rescue_score_floor=rescue_score_floor,
+        valid_citations=valid,
     )

@@ -84,6 +84,19 @@ def test_build_candidates_direct_regex_hit():
     assert candidates[0].direct_regex_hit is True
 
 
+def test_build_candidates_llm_not_in_extracted_no_direct_hit():
+    """LLM-injected articles not in extracted channel must not get direct_regex_hit."""
+    scored = [("Art. 273 ZGB", 0.0), ("Art. 146 StGB", 0.8)]
+    rrf_scores = {"Art. 273 ZGB": 0.02, "Art. 146 StGB": 0.05}
+    source_rankings = {
+        "extracted": [],
+        "bm25_law": ["Art. 273 ZGB", "Art. 146 StGB"],
+    }
+    candidates = build_candidates(scored, rrf_scores, source_rankings, None)
+    art273 = next(c for c in candidates if c.citation == "Art. 273 ZGB")
+    assert art273.direct_regex_hit is False
+
+
 def test_build_candidates_expected_code_match():
     scored = [("Art. 146 StGB", 0.8), ("BGE 145 IV 154 E. 1.1", 0.6)]
     rrf_scores = {"Art. 146 StGB": 0.05, "BGE 145 IV 154 E. 1.1": 0.04}
@@ -287,6 +300,19 @@ def test_assemble_direct_hit_overflow():
     assert "Art. 237 StPO" in result   # forced in via direct_regex_hit
 
 
+def test_assemble_drops_non_corpus():
+    """Non-corpus citations are excluded even with direct_regex_hit overflow."""
+    cs = [
+        _make_candidate("Art. 146 StGB", rerank_score=0.9),
+        _make_candidate("Art. 273 ZGB", rerank_score=0.8, direct_regex_hit=True),
+    ]
+    for i, c in enumerate(cs):
+        c.final_score = 1.0 - i * 0.1
+    result = assemble(cs, n_final=1, valid_citations=set(CORPUS_TEXTS))
+    assert result == ["Art. 146 StGB"]
+    assert "Art. 273 ZGB" not in result
+
+
 def test_assemble_rescue_floor_removes_low_quality():
     """Rescue candidate with rerank_score < floor is excluded."""
     cs = [
@@ -358,6 +384,23 @@ def test_run_selector_end_to_end():
     assert len(result) >= 1
     assert all(isinstance(c, str) for c in result)
     # Art. 146 StGB has relevance=3 (highest) — must appear in result
+    assert "Art. 146 StGB" in result
+
+
+def test_run_selector_filters_non_corpus_scored():
+    scored = [("Art. 146 StGB", 0.9), ("Art. 999 ZGB", 0.8)]
+    rrf_scores = {"Art. 146 StGB": 0.05, "Art. 999 ZGB": 0.04}
+    source_rankings = {"bm25_law": ["Art. 146 StGB", "Art. 999 ZGB"]}
+    fake_response = {
+        "candidate_scores": [{"id": "C000", "relevance": 3, "reason": "direct"}],
+        "estimated_answer_count": 1,
+    }
+    with patch("retrieval.selector.chat_json", return_value=fake_response):
+        result = run_selector(
+            "fraud query", FakeQueryInfo(), scored, rrf_scores,
+            source_rankings, CORPUS_TEXTS,
+        )
+    assert "Art. 999 ZGB" not in result
     assert "Art. 146 StGB" in result
 
 
